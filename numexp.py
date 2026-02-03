@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from line_profiler import profile
+torch.manual_seed(0)
 """
     Numerical experiment for stochastic mechanism design. A mechanism designer procures fixed demand D from multiple uncertain sources and a dispatchable source such that expected system cost is minimized.
 """
@@ -52,6 +53,7 @@ class StochMechDesign:
         x1 = torch.tensor([0.5 for _ in range(n)] + [0], requires_grad=True, dtype=torch.float32)
         sigma = torch.tensor(sigma, dtype=torch.float32)
         optimizer = torch.optim.SGD([x1], lr=0.01)
+        scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=lambda epoch: 0.95)
 
         for _ in range(1000):
             x1_prev = x1.detach().numpy().copy()
@@ -63,6 +65,7 @@ class StochMechDesign:
 
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             # projection step
             with torch.no_grad():
@@ -228,7 +231,7 @@ if __name__ == "__main__":
     # reserve_impact()
     # dispatchable_impact()
     # dynamic_vs_static()
-    utility_on_lying(i=2)
+    utility_on_lying(i=0)
 
     # outcome1 = f1(sigma)
     # print("First-stage decision: ", outcome1)
