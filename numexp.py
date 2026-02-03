@@ -3,7 +3,8 @@ import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
 import matplotlib.pyplot as plt
-import tqdm
+from tqdm import tqdm
+from line_profiler import profile
 """
     Numerical experiment for stochastic mechanism design. A mechanism designer procures fixed demand D from multiple uncertain sources and a dispatchable source such that expected system cost is minimized.
 """
@@ -23,9 +24,13 @@ class StochMechDesign:
         self.n = len(self.sigma) # number of uncertain sources
         self.batch_size = 100 # batch size for stochastic approximation of gradient in SGD
 
+        # stored first-stage decisions
+        self.x1_cache = {} # indexed by excluded participant
+
     def update_params(self, params: dict):
         for key, value in params.items():
             setattr(self, key, value)
+        self.x1_cache = {} # reset cache
 
     def c1(self, x1):
         return self.a_1 * np.pow(x1[-1], self.b_1)
@@ -33,9 +38,15 @@ class StochMechDesign:
     def c2(self, x1, x2):
         return self.a_2 * np.pow(abs(x2), self.b_2)
 
-    def f1(self, sigma: list):
+    def f1(self, excl: int = -1):
         # Here we solve a stochastic optimization problem using CVXPY and projected SGD, and return the first-stage decision.
 
+        if excl in self.x1_cache.keys():
+            return self.x1_cache[excl]
+        
+        sigma = self.sigma.copy()
+        if excl != -1:
+            sigma.pop(excl)
         n = len(sigma)
 
         x1 = torch.tensor([0.5 for _ in range(n)] + [0], requires_grad=True, dtype=torch.float32)
@@ -70,7 +81,8 @@ class StochMechDesign:
                 if np.linalg.norm(x1.numpy() - x1_prev, 2) < 1e-5:
                     # print("Converged at epoch ", epoch)
                     break
-        # print("Last error: ", np.linalg.norm(x1.detach().numpy() - x1_prev, 2))
+       
+        self.x1_cache[excl] = x1.detach().numpy()
         return x1.detach().numpy()
 
     def f2(self, sigma: list, x1, theta: list):
@@ -82,15 +94,14 @@ class StochMechDesign:
 
     def h1(self, sigma: list, i):
         # Computes h_i^1 (sigma_{-i})
-        x1_i = self.f1(sigma[:i] + sigma[i+1:])
+        x1_i = self.f1(excl=i)
         return self.c1(x1_i)
 
-    def t1(self, sigma: list, i):
-        x1 = self.f1(sigma)
+    def t1(self, sigma: list, x1, i):
         return -self.c1(x1) + self.h1(sigma, i)
 
     def g2(self, sigma: list, theta: list, i):
-        x1_i = self.f1(sigma[:i] + sigma[i+1:])
+        x1_i = self.f1(excl=i)
         x2_i = self.f2(sigma[:i] + sigma[i+1:], x1_i, theta[:i] + theta[i+1:])
         return self.c2(x1_i, x2_i)
 
@@ -102,16 +113,17 @@ class StochMechDesign:
         return self.utilityD - self.c1(x1) - self.c2(x1, x2)
     
     def first_stage_outcome(self, ):
-        return self.f1(self.sigma)
+        return self.f1()
 
     def second_stage_outcome(self, x1, seed=0) -> tuple:
         np.random.seed(seed)
         theta_sample = list(np.random.normal(self.mu, self.real_sigma)) # realized production
         return self.f2(self.sigma, x1, theta_sample), theta_sample
-        
+    
+    @profile
     def average_outcomes(self, num_samples=100):
         x1 = self.first_stage_outcome()
-        payment1 = [self.t1(self.sigma, i) for i in range(self.n)]
+        payment1 = [self.t1(self.sigma, x1, i) for i in range(self.n)]
         sw_values = []
         budget_balances = []
         payments = []
@@ -167,6 +179,27 @@ def dispatchable_impact():
 
     return None
     
+def utility_on_lying(i):
+    market = StochMechDesign()
+    utilities = []
+    sigma = market.real_sigma.copy()
+    sigma_values = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]
+    for s in tqdm(sigma_values):
+        sigma[i] = s
+        market.update_params({'sigma': sigma})
+        sw, budget_balance, payments = market.average_outcomes()
+        utilities.append(payments[i])
+    fig = plt.figure()
+    plt.rcParams.update({'font.size': 14})
+    ax = fig.add_subplot(1,1,1)
+    ax.plot(sigma_values, utilities, marker='o')
+    ax.set_xlabel(f'Reported sigma by participant {i+1}')
+    ax.set_ylabel('Average Payment Received')
+    ax.set_title(f'Impact of Lying on Participant {i+1}\'s Payment')
+    plt.show()
+    return None
+    
+
 def dynamic_vs_static():
     # so in static, participants will lie but their real sigma will remain the same
     market_dynamic = StochMechDesign()
@@ -194,7 +227,8 @@ if __name__ == "__main__":
     
     # reserve_impact()
     # dispatchable_impact()
-    dynamic_vs_static()
+    # dynamic_vs_static()
+    utility_on_lying(i=2)
 
     # outcome1 = f1(sigma)
     # print("First-stage decision: ", outcome1)
