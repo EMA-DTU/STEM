@@ -14,15 +14,15 @@ torch.manual_seed(0)
 
 
 class StochasticMarket:
-    def __init__(self, delta: list = [[[-100, 20, 100], [0, 1, 0]],
-                                      [[-100, 20, 100], [0, 2, 0]],
-                                      [[-100, 20, 100], [0, 4, 0]],
-                                      [[-100, 20, 100], [0, 6, 0]],
-                                      [[-100, 20, 100], [0, 8, 0]],
+    def __init__(self, delta: list = [[[-5, 20, 100], [0, 1, 0]],
+                                      [[-4, 20, 100], [0, 2, 0]],
+                                      [[-3, 20, 100], [0, 4, 0]],
+                                      [[-2, 20, 100], [0, 6, 0]],
+                                      [[-1, 20, 100], [0, 8, 0]],
                                     #   [[-100, 20, 100], [0, 16, 0]],
                                     #   [[-0.5, 20, 100], [0, 6, 0]],
                                      ], 
-                D: int = 100, alpha_1=3, alpha_2=7, alpha_3=8, alpha_4=100):
+                D: int = 100, alpha_1=3, alpha_2=7, alpha_3=8, alpha_4=50):
         self.D = D # fixed demand
         self.real_delta = delta # true cost parameters
         self.delta = copy.deepcopy(self.real_delta) # reported parameters (n x 2 x 3)
@@ -37,8 +37,6 @@ class StochasticMarket:
         self.x1_cache = {} # indexed by excluded participant
         self.x2_scenarios_cache = None
         self.x2_cache = {} # indexed by excluded participant
-
-        self.M = 100 * self.D # big-M constant for linearization of second-stage cost function
 
         self.real_theta = None
         self.theta = None
@@ -200,25 +198,88 @@ class StochasticMarket:
         return self.c1(x1) + self.c2(x1, x2) + np.sum([self.ci(theta[i], x1, x2, i) for i in range(self.n)])
 
     def average_outcomes(self, ):
+        # Plots and saves all the metrics for the mechanism with variance for second-stage metrics
+        metrics = {}
         x1 = self.first_stage_outcome()
         payment1 = [self.t1(i) for i in range(self.n)]
+        metrics['first_stage_dispatch'] = x1[:-2]
+        metrics['reserve_capacity'] = x1[-2]
+        metrics['dispatchable_power'] = x1[-1]
+
+        producer_costs = []
+        payment2s = []
+        payments = []
         utilities = []
-        reserve = []
-        final_dispatch = []
-        costs = []
+        reserve_activations = []
+        dispatch2s = []
+        load_sheds = []
         system_costs = []
         for j in range(self.batch_size):
             theta_sample = self.realize_theta(seed=j)
             x2 = self.second_stage_outcome()
-            payment2 = [self.t2(i) for i in range(self.n)]
-            # sw_values.append(self.social_welfare(theta_sample, x1, x2))
-            # budget_balances.append( -np.sum(payment1) - np.sum(payment2) - self.c1(x1) - self.c2(x1, x2) + self.utilityD )
-            utilities.append( [payment1[i] + payment2[i] - self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
-            reserve.append(x2[-1])
-            final_dispatch.append( np.multiply(x2[:-1], x1[:-1]) )
-            costs.append( [self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
+            payment2s.append([self.t2(i) for i in range(self.n)])
+            payments.append( [payment1[i] + payment2s[j][i] for i in range(self.n)] )
+            producer_costs.append( [self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
+            utilities.append( [payments[j][i] - producer_costs[j][i] for i in range(self.n)] )
+            reserve_activations.append(x2[-2])
+            load_sheds.append(x2[-1])
+            dispatch2s.append(x2[:-2])
             system_costs.append(self.system_cost(x1, x2, theta_sample))
-        return utilities, reserve, final_dispatch, costs, system_costs
+        
+        fig1 = plot_average_deviation(np.arange(1, self.n+1), producer_costs, xlabel='Producer', ylabel='Cost', title='Average Producer Costs with Std Dev')
+        fig2 = plot_average_deviation([str(i+1) + 'x' if x1[i] <= 0 else str(i+1) for i in range(self.n)], [payment1, payment2s, payments], xlabel='Producer', ylabel='Payment', title='Average Payments with Std Dev', legends=['First-stage payment', 'Second-stage payment', 'Total payment'])
+        fig3 = plot_average_deviation(np.arange(1, self.n+1), utilities, xlabel='Producer', ylabel='Utility', title='Average Utilities with Std Dev')
+        fig4 = plot_average_deviation([1], reserve_activations, xlabel='', ylabel='Reserve Activation', title=f'Reserve Activations (Procured: {metrics["reserve_capacity"]:.2f}, Dispatchable: {metrics["dispatchable_power"]:.2f})')
+        fig5 = plot_average_deviation([1], load_sheds, xlabel='', ylabel='Load Shedding', title='Load Shedding')
+        fig6 = plot_average_deviation([1], system_costs, xlabel='', ylabel='System Cost', title='System Costs')
+
+        fig1.savefig('producer_costs.pdf')
+        fig2.savefig('payments.pdf')
+        fig3.savefig('utilities.pdf')
+        fig4.savefig('reserve_activations.pdf')
+        fig5.savefig('load_sheds.pdf')
+        fig6.savefig('system_costs.pdf')
+
+        return None
+
+def plot_average_deviation(x: list, y: list, xlabel: str, ylabel: str, title: str, legends: list = None):
+    # y: (batch_size, n) or (batch_size,)
+    fig = plt.figure()
+    plt.rcParams.update({'font.size': 12})
+    ax = fig.add_subplot(1,1,1)
+
+    if legends is not None:
+        assert len(legends) == len(y), "Length of legends must match length of y"
+        for j in range(len(legends)):
+            if len(np.shape(y[j])) == 2:
+                y_mean = np.mean(y[j], axis=0)
+                y_std = np.std(y[j], axis=0)
+            else:
+                y_mean = y[j]
+                y_std = np.zeros_like(y_mean)
+        
+            ax.plot(x, y_mean, marker='o', label=legends[j])
+            ax.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.2)
+            ax.set_xlabel(xlabel)
+            ax.legend()
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+    else:
+        if len(np.shape(y)) == 2:
+            y_mean = np.mean(y, axis=0)
+            y_std = np.std(y, axis=0)
+        else:
+            y_mean = y
+            y_std = np.zeros_like(y_mean)
+
+
+    
+        ax.boxplot(np.array(y), positions=x, widths=0.5)
+        # ax.fill_between(x, y_mean - y_std, y_mean + y_std, alpha=0.2)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+    return fig
 
 def dispatchable_impact():
     # impact of dispatchable cost on dispatchable power
@@ -311,12 +372,13 @@ def dynamic_vs_static():
 if __name__ == "__main__":
     np.random.seed(0)
     
-    reserve_impact_on_dispatchable()
-    dispatchable_impact()
+    # reserve_impact_on_dispatchable()
+    # dispatchable_impact()
     # dynamic_vs_static()
-    # utility_on_lying(i=4)
+    # utility_on_lying(i=1)
 
-    # market = StochasticMarket()
+    market = StochasticMarket()
+    market.average_outcomes()
     # x1 = market.x1star()
     # print("First-stage dispatch: ", x1[:-2])
     # print("Dispatchable power: ", x1[-1])
