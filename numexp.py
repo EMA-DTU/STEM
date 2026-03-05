@@ -5,222 +5,305 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 from line_profiler import profile
+import warnings
+import copy
 torch.manual_seed(0)
 """
     Numerical experiment for stochastic mechanism design. A mechanism designer procures fixed demand D from multiple uncertain sources and a dispatchable source such that expected system cost is minimized.
 """
 
 
-class StochMechDesign:
-    def __init__(self, ):
-        self.D = 100 # fixed demand
-        self.mu = 25 # mean capacity of uncertain sources
-        self.real_sigma = [1, 2, 4, 8, 16] # true std dev of uncertain sources
-        self.sigma = self.real_sigma.copy() # reported std dev of uncertain sources
-        self.a_1 = 1
-        self.b_1 = 2
-        self.a_2 = 2
-        self.b_2 = 1.5
-        self.utilityD = 5000 # utility of demand
-        self.n = len(self.sigma) # number of uncertain sources
-        self.batch_size = 100 # batch size for stochastic approximation of gradient in SGD
+class StochasticMarket:
+    def __init__(self, delta: list = [[[-100, 20, 100], [0, 1, 0]],
+                                      [[-100, 20, 100], [0, 2, 0]],
+                                      [[-100, 20, 100], [0, 4, 0]],
+                                      [[-100, 20, 100], [0, 6, 0]],
+                                      [[-100, 20, 100], [0, 8, 0]],
+                                    #   [[-100, 20, 100], [0, 16, 0]],
+                                    #   [[-0.5, 20, 100], [0, 6, 0]],
+                                     ], 
+                D: int = 100, alpha_1=3, alpha_2=7, alpha_3=8, alpha_4=100):
+        self.D = D # fixed demand
+        self.real_delta = delta # true cost parameters
+        self.delta = copy.deepcopy(self.real_delta) # reported parameters (n x 2 x 3)
+        self.alpha_1 = alpha_1 # marginal cost of reserve capacity
+        self.alpha_2 = alpha_2 # marginal cost of dispatchable power
+        self.alpha_3 = alpha_3 # reserve activation cost
+        self.alpha_4 = alpha_4 # load shedding cost
+        self.n = len(self.delta) # number of sources
+        self.batch_size = 1000 # batch size for finite sample approximation of second-stage costs in first-stage optimization
 
         # stored first-stage decisions
         self.x1_cache = {} # indexed by excluded participant
+        self.x2_scenarios_cache = None
+        self.x2_cache = {} # indexed by excluded participant
+
+        self.M = 100 * self.D # big-M constant for linearization of second-stage cost function
+
+        self.real_theta = None
+        self.theta = None
 
     def update_params(self, params: dict):
         for key, value in params.items():
             setattr(self, key, value)
         self.x1_cache = {} # reset cache
+        self.x2_scenarios_cache = None
+        self.x2_cache = {} # reset cache
 
     def c1(self, x1):
-        return self.a_1 * np.pow(x1[-1], self.b_1)
+        # First-stage decision cost
+        return self.alpha_1 * x1[-2] + self.alpha_2 * x1[-1]
 
     def c2(self, x1, x2):
-        return self.a_2 * np.pow(abs(x2), self.b_2)
+        # Second-stage decision cost
+        return self.alpha_3 * x2[-2] + self.alpha_4 * x2[-1]
 
-    def f1(self, excl: int = -1):
-        # Here we solve a stochastic optimization problem using CVXPY and projected SGD, and return the first-stage decision.
+    def ci(self, thetai: list, x1, x2, i):
+        # Sanity check: costs computed by gurobi should match this function
+        if x2[i] <= thetai[1]:
+            return thetai[0]*(x2[i] - thetai[1])
+        else:
+            return thetai[2]*(x2[i] - thetai[1])
 
+    def generate_theta_samples(self, delta, n_samples, seed=0):
+        theta_samples = [] # (batch_size, n, 3)
+        for k in range(n_samples):
+            theta_samples.append([])
+            for i in range(len(delta)):
+                np.random.seed(seed + k)
+                theta_1 = np.random.normal(delta[i][0][0], delta[i][1][0])
+                theta_2 = np.clip(np.random.normal(delta[i][0][1], delta[i][1][1]), 0, 40) # max and min capacity of producers
+                theta_3 = np.random.normal(delta[i][0][2], delta[i][1][2])
+                theta_samples[-1].append([theta_1, theta_2, theta_3])
+        return theta_samples
+    
+    def x1star(self, excl: int = -1):
+        # Here, we solve the first-stage market problem using Gurobipy by a finite sample approximation of the second-stage costs, and return the optimal first-stage decision.
         if excl in self.x1_cache.keys():
             return self.x1_cache[excl]
+
+        n = self.n
+
+        theta_samples = self.generate_theta_samples(self.delta, self.batch_size)
         
-        sigma = self.sigma.copy()
+        model = gp.Model("First-stage optimization")
+        model.setParam('OutputFlag', 0)
+        model.setParam('TimeLimit', 200)
+        
+        x1n = model.addVars(n, lb=0, ub=1, vtype=GRB.BINARY, name="x1n") # unit commitment decision for uncertain sources
+        x1n1 = model.addVar(lb=0, ub=self.D, name="x1n1") # reserve capacity
+        x1n2 = model.addVar(lb=0, ub=self.D, name="x1n2") # dispatchable power
+        x2n = [model.addVars(n, lb=0, ub=self.D, name="x2_{}".format(k)) for k in range(self.batch_size)] # final dispatch for uncertain sources (batch_size, n)
+        x2n1 = [model.addVar(lb=0, name="x2n1_{}".format(k)) for k in range(self.batch_size)] # reserve activation (batch_size)
+        x2n2 = [model.addVar(lb=0, name="x2n2_{}".format(k)) for k in range(self.batch_size)] # load shedding (batch_size)
+        # y2 = model.addVars(self.batch_size, lb=0, name='y2') # auxiliary variable representing abs(x2n1)
+        w = [model.addVars(n, lb=0, name="w_{}".format(k)) for k in range(self.batch_size)] # auxiliary variables for linearization of second-stage dispatch constraints
+        c = [model.addVars(n, lb=0, name="c_{}".format(k)) for k in range(self.batch_size)] # cost variables for producers
+
+        model.setObjective( self.alpha_1 * x1n1 + self.alpha_2 * x1n2 + (1/self.batch_size) * ( gp.quicksum(self.alpha_3 * x2n1[k] + self.alpha_4 * x2n2[k] + gp.quicksum(c[k][i] for i in range(n)) for k in range(self.batch_size)) ), GRB.MINIMIZE)
+
+        [model.addGenConstrPWL(x2n[k][i], c[k][i], [0, theta_samples[k][i][1], self.D], [-theta_samples[k][i][0]*theta_samples[k][i][1], 0, theta_samples[k][i][2]*(self.D - theta_samples[k][i][1])]) for k in range(self.batch_size) for i in range(n)]
+        
+        # model.addConstrs( y2[k] >= x2n1[k] for k in range(self.batch_size) )
+        # model.addConstrs( y2[k] >= -x2n1[k] for k in range(self.batch_size) )
+        model.addConstrs( x2n1[k] <= x1n1 for k in range(self.batch_size) )
+
+        model.addConstrs( (self.D - gp.quicksum(w[k][i] for i in range(n)) - x1n2 - x2n1[k] - x2n2[k] == 0 for k in range(self.batch_size)), name="balance" )
+        model.addConstrs( w[k][i] <= x1n[i] * self.D for k in range(self.batch_size) for i in range(n) )
+        model.addConstrs( w[k][i] <= x2n[k][i] for k in range(self.batch_size) for i in range(n) )
+        model.addConstrs( w[k][i] >= x2n[k][i] - self.D * (1-x1n[i]) for k in range(self.batch_size) for i in range(n) )
+
         if excl != -1:
-            sigma.pop(excl)
-        n = len(sigma)
+            model.addConstr( x1n[excl] == 0 )
 
-        x1 = torch.tensor([0.5 for _ in range(n)] + [0], requires_grad=True, dtype=torch.float32)
-        sigma = torch.tensor(sigma, dtype=torch.float32)
-        optimizer = torch.optim.SGD([x1], lr=0.01)
-        scheduler = torch.optim.lr_scheduler.MultiplicativeLR(optimizer, lr_lambda=lambda epoch: 0.95)
+        model.optimize()
 
-        for _ in range(1000):
-            x1_prev = x1.detach().numpy().copy()
-            optimizer.zero_grad()
+        if model.status != GRB.OPTIMAL:
+            print("Gurobi not optimal: ", model.status)
+        
+        x1_opt = [x1n[i].x for i in range(n)] + [x1n1.x] + [x1n2.x]
+        x2_opt = [[x2n[k][i].x for i in range(n)] + [x2n1[k].x] + [x2n2[k].x] for k in range(self.batch_size)]
+        self.x1_cache[excl] = x1_opt
+        if excl == -1:
+            self.x2_scenarios_cache = x2_opt
+        return x1_opt
+    
+    def realize_theta(self, seed=0):
+        self.real_theta = self.generate_theta_samples(self.real_delta, 1, seed=seed)[0]
+        self.theta = copy.deepcopy(self.real_theta)
+        self.x2_cache = {}
 
-            zeta = torch.normal(mean=0, std=1, size=(self.batch_size, n)) # (batch_size, n)
+        return self.theta
 
-            loss = self.a_1 * torch.pow(x1[-1], self.b_1) + self.a_2 * torch.mean(torch.pow(torch.abs(torch.mul(torch.mul(sigma, x1[:-1]), zeta).sum(dim=1)), self.b_2))
+    def x2star(self, excl: int = -1):
+        # Here, we solve the second-stage market problem using Gurobipy, and return the optimal second-stage decision.
+        if excl in self.x2_cache.keys():
+            return self.x2_cache[excl]
+        
+        x1 = self.x1star(excl=excl)
+        n = self.n
 
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+        model = gp.Model("Second-stage optimization")
+        model.setParam('OutputFlag', 0)
+        x2n = model.addVars(n, lb=0, ub=self.D, name="x2") # final dispatch for uncertain sources
+        x2n1 = model.addVar(lb=0, name="x2n1") # reserve activation
+        x2n2 = model.addVar(lb=0, name="x2n2") # load shedding
+        # y2 = model.addVar(lb=0, name='y2') # auxiliary variable representing abs(x2n1)
+        # z2 = model.addVar(lb=0, ub=1, vtype=GRB.BINARY, name='z2')
+        c = model.addVars(n, lb=0, name="c") # cost variables for producers
+        
+        model.setObjective( self.alpha_3 * x2n1 + self.alpha_4 * x2n2 + gp.quicksum( c[i] for i in range(n) ), GRB.MINIMIZE )
+        
+        [model.addGenConstrPWL(x2n[i], c[i], [0, self.theta[i][1], self.D], [-self.theta[i][0]*self.theta[i][1], 0, self.theta[i][2]*(self.D - self.theta[i][1])]) for i in range(n)]
+        model.addConstr( self.D - gp.quicksum(x2n[i] * x1[i] for i in range(n)) - x1[-1] - x2n1 - x2n2 == 0, name="balance" )
+        model.addConstr( x2n1 <= x1[-2] )
 
-            # projection step
-            with torch.no_grad():
-                qp = gp.Model("Projection QP")
-                qp.setParam('OutputFlag', 0)
-                xprime = qp.addVars(n+1, lb = 0, ub = [[1]*n + [self.D]])
-                y = x1.numpy()
-                qp.setObjective(gp.quicksum((xprime[i] - y[i]) * (xprime[i] - y[i]) for i in range(n+1)), GRB.MINIMIZE)
-                qp.addConstr(gp.quicksum(self.mu * xprime[i] for i in range(n)) + xprime[n] == self.D)
-                qp.optimize()
-                if qp.status != GRB.OPTIMAL:
-                    print("QP not optimal: ", qp.status)
-                x1[:] = torch.tensor([xprime[i].x for i in range(n+1)], dtype=torch.float32)
+        model.optimize()
 
-                # stopping criterion
-                if np.linalg.norm(x1.numpy() - x1_prev, 2) < 1e-5:
-                    # print("Converged at epoch ", epoch)
-                    break
-       
-        self.x1_cache[excl] = x1.detach().numpy()
-        return x1.detach().numpy()
+        if model.status != GRB.OPTIMAL:
+            print("Gurobi not optimal: ", model.status)
+        x2_opt = [x2n[i].x for i in range(n)] + [x2n1.x] + [x2n2.x]
+        self.x2_cache[excl] = x2_opt
+        return x2_opt
 
-    def f2(self, sigma: list, x1, theta: list):
-        # returns the required amount of reserve activation (negative value indicates downregulation)
-        n = len(sigma)
-        assert len(sigma) == len(theta), "Length of sigma and theta must be the same"
-        assert len(x1) == n + 1, "Length of x1 must be n + 1"
-        return -(sum([theta[i]*x1[i] for i in range(n)]) + x1[n] - self.D)
-
-    def h1(self, sigma: list, i):
-        # Computes h_i^1 (sigma_{-i})
-        x1_i = self.f1(excl=i)
+    def h1(self, i):
+        # Computes h_i^1 (delta_{-i})
+        x1_i = self.x1star(excl=i)
         return self.c1(x1_i)
+        # return 0
 
-    def t1(self, sigma: list, x1, i):
-        return -self.c1(x1) + self.h1(sigma, i)
+    def t1(self, i):
+        x1 = self.x1star()
+        return -self.c1(x1) + self.h1(i)
 
-    def g2(self, sigma: list, theta: list, i):
-        x1_i = self.f1(excl=i)
-        x2_i = self.f2(sigma[:i] + sigma[i+1:], x1_i, theta[:i] + theta[i+1:])
-        return self.c2(x1_i, x2_i)
+    def g2(self, i):
+        x1_i = self.x1star(excl=i)
+        x2_i = self.x2star(excl=i)
 
-    def t2(self, sigma: list, x1, theta: list, i):
-        x2 = self.f2(sigma, x1, theta)
-        return -self.c2(x1, x2) + self.g2(sigma, theta, i)
+        return self.c2(x1_i, x2_i) + np.sum([self.ci(self.theta[j], x1_i, x2_i, j) for j in range(self.n) if j != i])
+        # return 0
 
-    def social_welfare(self, theta: list, x1, x2):
-        return self.utilityD - self.c1(x1) - self.c2(x1, x2)
+    def t2(self, i):
+        x1 = self.x1star()
+        x2 = self.x2star()
+        return self.ci(self.theta[i], x1, x2, i) - ( self.c2(x1, x2) + np.sum([self.ci(self.theta[j], x1, x2, j) for j in range(self.n)]) ) + self.g2(i)
     
     def first_stage_outcome(self, ):
-        return self.f1()
+        return self.x1star()
 
-    def second_stage_outcome(self, x1, seed=0) -> tuple:
-        np.random.seed(seed)
-        theta_sample = list(np.random.normal(self.mu, self.real_sigma)) # realized production
-        return self.f2(self.sigma, x1, theta_sample), theta_sample
-    
-    @profile
-    def average_outcomes(self, num_samples=100):
+    def second_stage_outcome(self, ) -> list:
+        if self.theta is None:
+            warnings.warn("Theta not realized yet")
+        return self.x2star()
+
+    def system_cost(self, x1, x2, theta):
+        return self.c1(x1) + self.c2(x1, x2) + np.sum([self.ci(theta[i], x1, x2, i) for i in range(self.n)])
+
+    def average_outcomes(self, ):
         x1 = self.first_stage_outcome()
-        payment1 = [self.t1(self.sigma, x1, i) for i in range(self.n)]
-        sw_values = []
-        budget_balances = []
-        payments = []
-        for j in range(num_samples):
-            x2, theta_sample = self.second_stage_outcome(x1, seed=j)
-            payment2 = [self.t2(self.sigma, x1, theta_sample, i) for i in range(self.n)]
-            sw_values.append(self.social_welfare(theta_sample, x1, x2))
-            budget_balances.append( -np.sum(payment1) - np.sum(payment2) - self.c1(x1) - self.c2(x1, x2) + self.utilityD )
-            payments.append( [payment1[i] + payment2[i] for i in range(self.n)] )
-        return np.mean(sw_values), np.mean(budget_balances), np.mean(payments, axis=0)
+        payment1 = [self.t1(i) for i in range(self.n)]
+        utilities = []
+        reserve = []
+        final_dispatch = []
+        costs = []
+        system_costs = []
+        for j in range(self.batch_size):
+            theta_sample = self.realize_theta(seed=j)
+            x2 = self.second_stage_outcome()
+            payment2 = [self.t2(i) for i in range(self.n)]
+            # sw_values.append(self.social_welfare(theta_sample, x1, x2))
+            # budget_balances.append( -np.sum(payment1) - np.sum(payment2) - self.c1(x1) - self.c2(x1, x2) + self.utilityD )
+            utilities.append( [payment1[i] + payment2[i] - self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
+            reserve.append(x2[-1])
+            final_dispatch.append( np.multiply(x2[:-1], x1[:-1]) )
+            costs.append( [self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
+            system_costs.append(self.system_cost(x1, x2, theta_sample))
+        return utilities, reserve, final_dispatch, costs, system_costs
 
-def reserve_impact():
-    # impact of reserve cost parameters on first stage decision
-    market = StochMechDesign()
-    dispatchable_power = []
-    a_2_values = [0.5, 1, 1.5, 2, 3, 4]
-    for a_2 in a_2_values:
-        market.update_params({'a_2': a_2})
-        f1 = market.first_stage_outcome()
-        dispatchable_power.append(f1[-1])
+def dispatchable_impact():
+    # impact of dispatchable cost on dispatchable power
+    dispatchable = []
+    market = StochasticMarket()
+    alpha_2_values = [2, 3, 4, 6, 9, 11, 13]
+    for alpha_2 in tqdm(alpha_2_values):
+        market.update_params({'alpha_2': alpha_2})
+        x1 = market.first_stage_outcome()
+        dispatchable.append(x1[-1])
     
     fig = plt.figure()
     plt.rcParams.update({'font.size': 14})
     ax = fig.add_subplot(1,1,1)
-    ax.plot(a_2_values, dispatchable_power, marker='o')
-    ax.set_xlabel('Reserve Cost Parameter a_2')
-    ax.set_ylabel('Dispatchable Power Procured')
-    ax.set_title('Impact of Reserve Cost on Dispatchable Power Procurement')
+    ax.plot(alpha_2_values, dispatchable, marker='o')
+    ax.set_xlabel('Dispatchable Cost Parameter alpha_2')
+    ax.set_ylabel('Dispatchable power procured')
+    ax.set_title('Impact of Dispatchable Cost on Dispatchable Power Procurement')
     plt.show()
-    # print(dispatchable_power)
 
     return None
     
-def dispatchable_impact():
-    # impact of reserve cost parameters on first stage decision
-    market = StochMechDesign()
-    dispatchable_power = []
-    a_1_values = [0.5, 1, 1.5, 2, 3, 4]
-    for a_1 in a_1_values:
-        market.update_params({'a_1': a_1})
-        f1 = market.first_stage_outcome()
-        dispatchable_power.append(f1[-1])
+def reserve_impact_on_dispatchable():
+    # impact of reserve activation cost on dispatchable power
+    dispatchable = []
+    market = StochasticMarket()
+    alpha_3_values = [5, 7, 8, 10, 12, 16]
+    for alpha_3 in tqdm(alpha_3_values):
+        market.update_params({'alpha_3': alpha_3})
+        x1 = market.first_stage_outcome()
+        dispatchable.append(x1[-1])
     
     fig = plt.figure()
     plt.rcParams.update({'font.size': 14})
     ax = fig.add_subplot(1,1,1)
-    ax.plot(a_1_values, dispatchable_power, marker='o')
-    ax.set_xlabel('Reserve Cost Parameter a_1')
-    ax.set_ylabel('Dispatchable Power Procured')
-    ax.set_title('Impact of dispatchable power cost on Dispatchable Power Procurement')
+    ax.plot(alpha_3_values, dispatchable, marker='o')
+    ax.set_xlabel('Reserve Activation Cost Parameter alpha_3')
+    ax.set_ylabel('Dispatchable power procured')
+    ax.set_title('Impact of Reserve Cost on Dispatchable Power Procurement')
     plt.show()
-    # print(dispatchable_power)
 
     return None
     
 def utility_on_lying(i):
-    market = StochMechDesign()
-    utilities = []
-    sigma = market.real_sigma.copy()
+    market = StochasticMarket()
+    utility = []
+    delta = copy.deepcopy(market.real_delta)
     sigma_values = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]
     for s in tqdm(sigma_values):
-        sigma[i] = s
-        market.update_params({'sigma': sigma})
-        sw, budget_balance, payments = market.average_outcomes()
-        utilities.append(payments[i])
+        delta[i][1][1] = s
+        market.update_params({'delta': delta})
+        utilities, reserve, final_dispatch, costs, system_costs = market.average_outcomes()
+        utility.append( np.mean(utilities, axis=0)[i] )
     fig = plt.figure()
     plt.rcParams.update({'font.size': 14})
     ax = fig.add_subplot(1,1,1)
-    ax.plot(sigma_values, utilities, marker='o')
+    ax.plot(sigma_values, utility, marker='o')
+    ax.vlines(market.real_delta[i][1][1], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], color='r', linestyle='--', label='True sigma')
     ax.set_xlabel(f'Reported sigma by participant {i+1}')
-    ax.set_ylabel('Average Payment Received')
-    ax.set_title(f'Impact of Lying on Participant {i+1}\'s Payment')
+    ax.set_ylabel('Average Utility Received')
+    ax.set_title(f'Impact of Lying on Participant {i+1}\'s Utility')
     plt.show()
     return None
-    
 
 def dynamic_vs_static():
     # so in static, participants will lie but their real sigma will remain the same
-    market_dynamic = StochMechDesign()
-    market_static = StochMechDesign()
-    market_static.update_params({'sigma': [0]*market_static.n}) # participants report zero uncertainty in static mechanism
+    market_dynamic = StochasticMarket()
+    market_static = StochasticMarket()
+    delta = copy.deepcopy(market_static.real_delta)
+    for i in range(market_static.n):
+        delta[i][1][1] = 0
+    market_static.update_params({'delta': delta}) # participants report zero uncertainty in static mechanism
 
-    dynamic_sw, dynamic_budget_balance, dynamic_payments = market_dynamic.average_outcomes()
-    static_sw, static_budget_balance, static_payments = market_static.average_outcomes()
+    dynamic_utilities, _, _, _, dynamic_system_costs = market_dynamic.average_outcomes()
+    static_utilites, _, _, _, static_system_costs = market_static.average_outcomes()
 
     print("Dynamic:")
     print("First-stage decision: ", market_dynamic.first_stage_outcome())
-    print("Payments: ", dynamic_payments)
-    print("Average social welfare: ", dynamic_sw)
+    print("Utilities: ", np.mean(dynamic_utilities, axis=0))
+    print("Average system cost: ", np.mean(dynamic_system_costs, axis=0))
 
     print("Static:")
     print("First-stage decision: ", market_static.first_stage_outcome())
-    print("Payments: ", static_payments)
-    print("Average social welfare: ", static_sw)
+    print("Utilities: ", np.mean(static_utilites, axis=0))
+    print("Average system cost: ", np.mean(static_system_costs, axis=0))
 
     return None
 
@@ -228,10 +311,36 @@ def dynamic_vs_static():
 if __name__ == "__main__":
     np.random.seed(0)
     
-    # reserve_impact()
-    # dispatchable_impact()
+    reserve_impact_on_dispatchable()
+    dispatchable_impact()
     # dynamic_vs_static()
-    utility_on_lying(i=0)
+    # utility_on_lying(i=4)
+
+    # market = StochasticMarket()
+    # x1 = market.x1star()
+    # print("First-stage dispatch: ", x1[:-2])
+    # print("Dispatchable power: ", x1[-1])
+    # print("Reserve capacity: ", x1[-2])
+    # print("")
+
+    # payments1 = np.round([market.t1(i) for i in range(market.n)], 2)
+    # market.realize_theta()
+    # print("Realized generation: ", np.round([market.theta[i][1] for i in range(market.n)], 2))
+    # x2 = market.x2star()
+    # payments2 = np.round([market.t2(i) for i in range(market.n)], 2)
+
+    # print("Second-stage dispatch: ", np.round(np.multiply(x2[:-2], x1[:-2]), 2))
+    # print("Second-stage reserve activation: ", np.round(x2[-2], 2))
+    # print("Second-stage load shedding: ", np.round(x2[-1], 2))
+    # print("")
+
+    # print("First-stage payments: ", payments1)
+    # print("Second-stage payments: ", payments2)
+    # print("Total payments: ", np.round([payments1[i] + payments2[i] for i in range(market.n)], 2))
+
+    # print("System cost: ", np.round(market.system_cost(x1, x2, market.theta), 2))
+
+
 
     # outcome1 = f1(sigma)
     # print("First-stage decision: ", outcome1)
