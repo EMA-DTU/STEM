@@ -7,6 +7,8 @@ from tqdm import tqdm
 from line_profiler import profile
 import warnings
 import copy
+import time
+import json
 torch.manual_seed(0)
 """
     Numerical experiment for stochastic mechanism design. A mechanism designer procures fixed demand D from multiple uncertain sources and a dispatchable source such that expected system cost is minimized.
@@ -14,15 +16,21 @@ torch.manual_seed(0)
 
 
 class StochasticMarket:
-    def __init__(self, delta: list = [[[-5, 20, 100], [0, 1, 0]],
-                                      [[-4, 20, 100], [0, 2, 0]],
-                                      [[-3, 20, 100], [0, 4, 0]],
-                                      [[-2, 20, 100], [0, 6, 0]],
-                                      [[-1, 20, 100], [0, 8, 0]],
+    def __init__(self, delta: list = [
+                                      [[-100, 20, 300], [0, 2, 0]],
+                                      [[-100, 20, 300], [0, 4, 0]],
+                                      [[-100, 20, 300], [0, 6, 0]],
+                                      [[-100, 20, 300], [0, 8, 0]],
+                                      [[-100, 20, 300], [0, 32, 0]],
+                                    #   [[-10, 20, 100], [0, 10, 0]],
+                                    #   [[-15, 20, 100], [0, 10, 0]],
+                                    #   [[-20, 20, 100], [0, 10, 0]],
+                                    #   [[-5, 20, 100], [0, 10, 0]],
+                                    #   [[-2, 20, 100], [0, 10, 0]],
                                     #   [[-100, 20, 100], [0, 16, 0]],
                                     #   [[-0.5, 20, 100], [0, 6, 0]],
                                      ], 
-                D: int = 100, alpha_1=3, alpha_2=7, alpha_3=8, alpha_4=50):
+                D: int = 100, alpha_1=10, alpha_2=6, alpha_3=8, alpha_4=200):
         self.D = D # fixed demand
         self.real_delta = delta # true cost parameters
         self.delta = copy.deepcopy(self.real_delta) # reported parameters (n x 2 x 3)
@@ -54,7 +62,7 @@ class StochasticMarket:
 
     def c2(self, x1, x2):
         # Second-stage decision cost
-        return self.alpha_3 * x2[-2] + self.alpha_4 * x2[-1]
+        return self.alpha_3 * abs(x2[-2]) + self.alpha_4 * x2[-1]
 
     def ci(self, thetai: list, x1, x2, i):
         # Sanity check: costs computed by gurobi should match this function
@@ -64,13 +72,14 @@ class StochasticMarket:
             return thetai[2]*(x2[i] - thetai[1])
 
     def generate_theta_samples(self, delta, n_samples, seed=0):
+        np.random.seed(seed)
         theta_samples = [] # (batch_size, n, 3)
         for k in range(n_samples):
             theta_samples.append([])
             for i in range(len(delta)):
-                np.random.seed(seed + k)
+                # np.random.seed(seed + i + k)
                 theta_1 = np.random.normal(delta[i][0][0], delta[i][1][0])
-                theta_2 = np.clip(np.random.normal(delta[i][0][1], delta[i][1][1]), 0, 40) # max and min capacity of producers
+                theta_2 = np.clip(np.random.normal(delta[i][0][1], delta[i][1][1]), 5, 35) # max and min capacity of producers
                 theta_3 = np.random.normal(delta[i][0][2], delta[i][1][2])
                 theta_samples[-1].append([theta_1, theta_2, theta_3])
         return theta_samples
@@ -91,20 +100,23 @@ class StochasticMarket:
         x1n = model.addVars(n, lb=0, ub=1, vtype=GRB.BINARY, name="x1n") # unit commitment decision for uncertain sources
         x1n1 = model.addVar(lb=0, ub=self.D, name="x1n1") # reserve capacity
         x1n2 = model.addVar(lb=0, ub=self.D, name="x1n2") # dispatchable power
-        x2n = [model.addVars(n, lb=0, ub=self.D, name="x2_{}".format(k)) for k in range(self.batch_size)] # final dispatch for uncertain sources (batch_size, n)
-        x2n1 = [model.addVar(lb=0, name="x2n1_{}".format(k)) for k in range(self.batch_size)] # reserve activation (batch_size)
+        x2n = [model.addVars(n, lb = 0, ub=self.D, name="x2_{}".format(k)) for k in range(self.batch_size)] # final dispatch for uncertain sources (batch_size, n)
+        x2n1 = [model.addVar(lb = -GRB.INFINITY, name="x2n1_{}".format(k)) for k in range(self.batch_size)] # reserve activation (batch_size)
+        y2 = [model.addVar(lb=0, name="y2_{}".format(k)) for k in range(self.batch_size)] # auxiliary variable representing abs(x2n1) (batch_size)
         x2n2 = [model.addVar(lb=0, name="x2n2_{}".format(k)) for k in range(self.batch_size)] # load shedding (batch_size)
         # y2 = model.addVars(self.batch_size, lb=0, name='y2') # auxiliary variable representing abs(x2n1)
         w = [model.addVars(n, lb=0, name="w_{}".format(k)) for k in range(self.batch_size)] # auxiliary variables for linearization of second-stage dispatch constraints
         c = [model.addVars(n, lb=0, name="c_{}".format(k)) for k in range(self.batch_size)] # cost variables for producers
 
-        model.setObjective( self.alpha_1 * x1n1 + self.alpha_2 * x1n2 + (1/self.batch_size) * ( gp.quicksum(self.alpha_3 * x2n1[k] + self.alpha_4 * x2n2[k] + gp.quicksum(c[k][i] for i in range(n)) for k in range(self.batch_size)) ), GRB.MINIMIZE)
+        model.setObjective( self.alpha_1 * x1n1 + self.alpha_2 * x1n2 + (1/self.batch_size) * ( gp.quicksum(self.alpha_3 * y2[k] + self.alpha_4 * x2n2[k] + gp.quicksum(c[k][i] for i in range(n)) for k in range(self.batch_size)) ), GRB.MINIMIZE)
 
         [model.addGenConstrPWL(x2n[k][i], c[k][i], [0, theta_samples[k][i][1], self.D], [-theta_samples[k][i][0]*theta_samples[k][i][1], 0, theta_samples[k][i][2]*(self.D - theta_samples[k][i][1])]) for k in range(self.batch_size) for i in range(n)]
         
-        # model.addConstrs( y2[k] >= x2n1[k] for k in range(self.batch_size) )
-        # model.addConstrs( y2[k] >= -x2n1[k] for k in range(self.batch_size) )
-        model.addConstrs( x2n1[k] <= x1n1 for k in range(self.batch_size) )
+        model.addConstrs( y2[k] >= x2n1[k] for k in range(self.batch_size) )
+        model.addConstrs( y2[k] >= -x2n1[k] for k in range(self.batch_size) )
+        model.addConstrs( y2[k] <= x1n1 for k in range(self.batch_size) )
+        model.addConstrs( x2n[k][i] - theta_samples[k][i][1] <= 15 for i in range(n) for k in range(self.batch_size) )
+        model.addConstrs( theta_samples[k][i][1] - x2n[k][i] <= 15 for i in range(n) for k in range(self.batch_size) )
 
         model.addConstrs( (self.D - gp.quicksum(w[k][i] for i in range(n)) - x1n2 - x2n1[k] - x2n2[k] == 0 for k in range(self.batch_size)), name="balance" )
         model.addConstrs( w[k][i] <= x1n[i] * self.D for k in range(self.batch_size) for i in range(n) )
@@ -126,11 +138,16 @@ class StochasticMarket:
             self.x2_scenarios_cache = x2_opt
         return x1_opt
     
-    def realize_theta(self, seed=0):
-        self.real_theta = self.generate_theta_samples(self.real_delta, 1, seed=seed)[0]
-        self.theta = copy.deepcopy(self.real_theta)
+    def realize_theta(self, seed=0, theta=None):
         self.x2_cache = {}
 
+        if theta is not None:
+            self.real_theta = theta
+            self.theta = copy.deepcopy(self.real_theta)
+            return self.theta
+        
+        self.real_theta = self.generate_theta_samples(self.real_delta, 1, seed=seed)[0]
+        self.theta = copy.deepcopy(self.real_theta)
         return self.theta
 
     def x2star(self, excl: int = -1):
@@ -143,18 +160,24 @@ class StochasticMarket:
 
         model = gp.Model("Second-stage optimization")
         model.setParam('OutputFlag', 0)
-        x2n = model.addVars(n, lb=0, ub=self.D, name="x2") # final dispatch for uncertain sources
-        x2n1 = model.addVar(lb=0, name="x2n1") # reserve activation
-        x2n2 = model.addVar(lb=0, name="x2n2") # load shedding
-        # y2 = model.addVar(lb=0, name='y2') # auxiliary variable representing abs(x2n1)
+        x2n = model.addVars(n, ub=self.D, name="x2") # final dispatch for uncertain sources
+        x2n1 = model.addVar(lb = - GRB.INFINITY, name="x2n1") # reserve activation
+        y2 = model.addVar(name='y2') # auxiliary variable representing abs(x2n1)
+        x2n2 = model.addVar(name="x2n2") # load shedding
         # z2 = model.addVar(lb=0, ub=1, vtype=GRB.BINARY, name='z2')
-        c = model.addVars(n, lb=0, name="c") # cost variables for producers
+        c = model.addVars(n, name="c") # cost variables for producers
         
-        model.setObjective( self.alpha_3 * x2n1 + self.alpha_4 * x2n2 + gp.quicksum( c[i] for i in range(n) ), GRB.MINIMIZE )
+        model.setObjective( self.alpha_3 * y2 + self.alpha_4 * x2n2 + gp.quicksum( c[i] for i in range(n) ), GRB.MINIMIZE )
         
         [model.addGenConstrPWL(x2n[i], c[i], [0, self.theta[i][1], self.D], [-self.theta[i][0]*self.theta[i][1], 0, self.theta[i][2]*(self.D - self.theta[i][1])]) for i in range(n)]
         model.addConstr( self.D - gp.quicksum(x2n[i] * x1[i] for i in range(n)) - x1[-1] - x2n1 - x2n2 == 0, name="balance" )
-        model.addConstr( x2n1 <= x1[-2] )
+        model.addConstr( y2 <= x1[-2] )
+        model.addConstr( y2 >= x2n1 )
+        model.addConstr( y2 >= -x2n1 )
+
+
+        model.addConstrs( x2n[i] - self.theta[i][1] <= 15 for i in range(n) )
+        model.addConstrs( self.theta[i][1] - x2n[i] <= 15 for i in range(n) )
 
         model.optimize()
 
@@ -197,7 +220,7 @@ class StochasticMarket:
     def system_cost(self, x1, x2, theta):
         return self.c1(x1) + self.c2(x1, x2) + np.sum([self.ci(theta[i], x1, x2, i) for i in range(self.n)])
 
-    def average_outcomes(self, ):
+    def average_outcomes(self, plot: bool = False):
         # Plots and saves all the metrics for the mechanism with variance for second-stage metrics
         metrics = {}
         x1 = self.first_stage_outcome()
@@ -214,9 +237,14 @@ class StochasticMarket:
         dispatch2s = []
         load_sheds = []
         system_costs = []
+        regulations = []
+
+        theta_samples = self.generate_theta_samples(self.real_delta, self.batch_size)
         for j in range(self.batch_size):
-            theta_sample = self.realize_theta(seed=j)
+            theta_sample = theta_samples[j]
+            self.realize_theta(seed = 0, theta=theta_sample)
             x2 = self.second_stage_outcome()
+            producer_regulation = list(np.array(x2[:-2]) - np.array([theta_sample[i][1] for i in range(self.n)]))
             payment2s.append([self.t2(i) for i in range(self.n)])
             payments.append( [payment1[i] + payment2s[j][i] for i in range(self.n)] )
             producer_costs.append( [self.ci(theta_sample[i], x1, x2, i) for i in range(self.n)] )
@@ -225,22 +253,34 @@ class StochasticMarket:
             load_sheds.append(x2[-1])
             dispatch2s.append(x2[:-2])
             system_costs.append(self.system_cost(x1, x2, theta_sample))
+            regulations.append(producer_regulation)
+
+
+        metrics['average_utility'] = list(np.mean(utilities, axis=0))
+        metrics['average_system_cost'] = np.mean(system_costs)
+        metrics['payment1'] = payment1
+        metrics['payment2'] = list(np.mean(payment2s, axis=0))
+        metrics['payment2std'] = list(np.std(payment2s, axis=0))
+
         
-        fig1 = plot_average_deviation(np.arange(1, self.n+1), producer_costs, xlabel='Producer', ylabel='Cost', title='Average Producer Costs with Std Dev')
-        fig2 = plot_average_deviation([str(i+1) + 'x' if x1[i] <= 0 else str(i+1) for i in range(self.n)], [payment1, payment2s, payments], xlabel='Producer', ylabel='Payment', title='Average Payments with Std Dev', legends=['First-stage payment', 'Second-stage payment', 'Total payment'])
-        fig3 = plot_average_deviation(np.arange(1, self.n+1), utilities, xlabel='Producer', ylabel='Utility', title='Average Utilities with Std Dev')
-        fig4 = plot_average_deviation([1], reserve_activations, xlabel='', ylabel='Reserve Activation', title=f'Reserve Activations (Procured: {metrics["reserve_capacity"]:.2f}, Dispatchable: {metrics["dispatchable_power"]:.2f})')
-        fig5 = plot_average_deviation([1], load_sheds, xlabel='', ylabel='Load Shedding', title='Load Shedding')
-        fig6 = plot_average_deviation([1], system_costs, xlabel='', ylabel='System Cost', title='System Costs')
+        if plot:
+            fig1 = plot_average_deviation(np.arange(1, self.n+1), producer_costs, xlabel='Producer', ylabel='Cost', title='Average Producer Costs with Std Dev')
+            fig2 = plot_average_deviation([str(i+1) + 'x' if x1[i] <= 0 else str(i+1) for i in range(self.n)], [payment1, payment2s, payments], xlabel='Producer', ylabel='Payment', title='Average Payments with Std Dev', legends=['First-stage payment', 'Second-stage payment', 'Total payment'])
+            fig3 = plot_average_deviation(np.arange(1, self.n+1), utilities, xlabel='Producer', ylabel='Utility', title='Average Utilities with Std Dev')
+            fig4 = plot_average_deviation([1], reserve_activations, xlabel='', ylabel='Reserve Activation', title=f'Reserve Activations (Procured: {metrics["reserve_capacity"]:.2f}, Dispatchable: {metrics["dispatchable_power"]:.2f})')
+            fig5 = plot_average_deviation([1], load_sheds, xlabel='', ylabel='Load Shedding', title='Load Shedding')
+            fig6 = plot_average_deviation([1], system_costs, xlabel='', ylabel='System Cost', title='System Costs')
+            fig7 = plot_average_deviation(np.arange(1, self.n+1), regulations, xlabel='Producer', ylabel='Regulation (Dispatch - Realized)', title='Producer Regulation Amounts with Std Dev')
 
-        fig1.savefig('producer_costs.pdf')
-        fig2.savefig('payments.pdf')
-        fig3.savefig('utilities.pdf')
-        fig4.savefig('reserve_activations.pdf')
-        fig5.savefig('load_sheds.pdf')
-        fig6.savefig('system_costs.pdf')
+            fig1.savefig('producer_costs.pdf')
+            fig2.savefig('payments.pdf')
+            fig3.savefig('utilities.pdf')
+            fig4.savefig('reserve_activations.pdf')
+            fig5.savefig('load_sheds.pdf')
+            fig6.savefig('system_costs.pdf')
+            fig7.savefig('regulations.pdf')
 
-        return None
+        return metrics
 
 def plot_average_deviation(x: list, y: list, xlabel: str, ylabel: str, title: str, legends: list = None):
     # y: (batch_size, n) or (batch_size,)
@@ -323,48 +363,68 @@ def reserve_impact_on_dispatchable():
 
     return None
     
-def utility_on_lying(i):
+def utility_on_lying():
+    # i = int(input("Enter participant index to test lying on (0-indexed): "))
     market = StochasticMarket()
     utility = []
     delta = copy.deepcopy(market.real_delta)
-    sigma_values = [0, 1, 2, 4, 6, 8, 10, 12, 14, 16]
-    for s in tqdm(sigma_values):
-        delta[i][1][1] = s
-        market.update_params({'delta': delta})
-        utilities, reserve, final_dispatch, costs, system_costs = market.average_outcomes()
-        utility.append( np.mean(utilities, axis=0)[i] )
+    sigma_values = [0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32]
+
     fig = plt.figure()
     plt.rcParams.update({'font.size': 14})
     ax = fig.add_subplot(1,1,1)
-    ax.plot(sigma_values, utility, marker='o')
-    ax.vlines(market.real_delta[i][1][1], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], color='r', linestyle='--', label='True sigma')
-    ax.set_xlabel(f'Reported sigma by participant {i+1}')
+
+    for i in range(market.n):
+        utility.append([])
+        for s in tqdm(sigma_values):
+            delta[i][1][1] = s
+            market.update_params({'delta': delta})
+            metrics = market.average_outcomes()
+            utility[i].append( metrics['average_utility'][i] )
+        ax.plot(sigma_values, utility[i], label=f'Participant {i+1}')
+        ax.plot(market.real_delta[i][1][1], utility[i][sigma_values.index(market.real_delta[i][1][1])], marker='o', color='r') # mark true value
+        delta[i][1][1] = market.real_delta[i][1][1] # reset to true value for next participant
+
+    # ax.vlines(market.real_delta[i][1][1], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], color='r', linestyle='--', label='True sigma')
+    ax.set_xlabel(f'Reported sigma by participants')
     ax.set_ylabel('Average Utility Received')
-    ax.set_title(f'Impact of Lying on Participant {i+1}\'s Utility')
-    plt.show()
-    return None
+    ax.set_title(f'Impact of Lying on Participants\' Utility')
+    fig.savefig(f'IC.pdf')
+    return np.round(utility, 2)
 
 def dynamic_vs_static():
     # so in static, participants will lie but their real sigma will remain the same
     market_dynamic = StochasticMarket()
     market_static = StochasticMarket()
     delta = copy.deepcopy(market_static.real_delta)
-    for i in range(market_static.n):
-        delta[i][1][1] = 0
-    market_static.update_params({'delta': delta}) # participants report zero uncertainty in static mechanism
+    
+    dynamic_metrics = market_dynamic.average_outcomes()
+    static_metrics = {}
 
-    dynamic_utilities, _, _, _, dynamic_system_costs = market_dynamic.average_outcomes()
-    static_utilites, _, _, _, static_system_costs = market_static.average_outcomes()
+    for d in [2, 10]:
+        for i in range(market_static.n):
+            delta[i][1][1] = d
+        market_static.update_params({'delta': delta}) # participants report zero uncertainty in static mechanism
+        static_metrics[d] = market_static.average_outcomes()
+    
+    json.dump({'dynamic': dynamic_metrics, 'static': static_metrics}, open('dynamic_vs_static.json', 'w'), indent=4)
 
-    print("Dynamic:")
-    print("First-stage decision: ", market_dynamic.first_stage_outcome())
-    print("Utilities: ", np.mean(dynamic_utilities, axis=0))
-    print("Average system cost: ", np.mean(dynamic_system_costs, axis=0))
+    # print("Static:")
+    # print("First-stage decision: ", market_static.first_stage_outcome())
+    # print("First-stage payments: ", static_metrics['payment1'])
+    # print("Second-stage payments: ", static_metrics['payment2'])
+    # print("Utilities: ", static_metrics['average_utility'])
+    # print("Average system cost: ", static_metrics['average_system_cost'])
+    
+    # print("Dynamic:")
+    # print("First-stage decision: ", market_dynamic.first_stage_outcome())
+    # print("First-stage payments: ", dynamic_metrics['payment1'])
+    # print("Second-stage payments: ", dynamic_metrics['payment2'])
+    # print("Utilities: ", dynamic_metrics['average_utility'])
+    # print("Average system cost: ", dynamic_metrics['average_system_cost'])
 
-    print("Static:")
-    print("First-stage decision: ", market_static.first_stage_outcome())
-    print("Utilities: ", np.mean(static_utilites, axis=0))
-    print("Average system cost: ", np.mean(static_system_costs, axis=0))
+    
+
 
     return None
 
@@ -375,11 +435,14 @@ if __name__ == "__main__":
     # reserve_impact_on_dispatchable()
     # dispatchable_impact()
     # dynamic_vs_static()
-    # utility_on_lying(i=1)
+    print(utility_on_lying())
 
-    market = StochasticMarket()
-    market.average_outcomes()
+    # start = time.time()
+    # market = StochasticMarket()
+    # print(market.average_outcomes(True))
     # x1 = market.x1star()
+    # print(x1)
+    # print(time.time() - start)
     # print("First-stage dispatch: ", x1[:-2])
     # print("Dispatchable power: ", x1[-1])
     # print("Reserve capacity: ", x1[-2])
