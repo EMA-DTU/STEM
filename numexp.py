@@ -10,9 +10,6 @@ import copy
 import time
 import json
 torch.manual_seed(0)
-"""
-    Numerical experiment for stochastic mechanism design. A mechanism designer procures fixed demand D from multiple uncertain sources and a dispatchable source such that expected system cost is minimized.
-"""
 
 
 class StochasticMarket:
@@ -27,8 +24,6 @@ class StochasticMarket:
                                     #   [[-20, 20, 100], [0, 10, 0]],
                                     #   [[-5, 20, 100], [0, 10, 0]],
                                     #   [[-2, 20, 100], [0, 10, 0]],
-                                    #   [[-100, 20, 100], [0, 16, 0]],
-                                    #   [[-0.5, 20, 100], [0, 6, 0]],
                                      ], 
                 D: int = 100, alpha_1=10, alpha_2=6, alpha_3=8, alpha_4=200):
         self.D = D # fixed demand
@@ -320,55 +315,12 @@ def plot_average_deviation(x: list, y: list, xlabel: str, ylabel: str, title: st
         ax.set_ylabel(ylabel)
         ax.set_title(title)
     return fig
-
-def dispatchable_impact():
-    # impact of dispatchable cost on dispatchable power
-    dispatchable = []
-    market = StochasticMarket()
-    alpha_2_values = [2, 3, 4, 6, 9, 11, 13]
-    for alpha_2 in tqdm(alpha_2_values):
-        market.update_params({'alpha_2': alpha_2})
-        x1 = market.first_stage_outcome()
-        dispatchable.append(x1[-1])
-    
-    fig = plt.figure()
-    plt.rcParams.update({'font.size': 14})
-    ax = fig.add_subplot(1,1,1)
-    ax.plot(alpha_2_values, dispatchable, marker='o')
-    ax.set_xlabel('Dispatchable Cost Parameter alpha_2')
-    ax.set_ylabel('Dispatchable power procured')
-    ax.set_title('Impact of Dispatchable Cost on Dispatchable Power Procurement')
-    plt.show()
-
-    return None
-    
-def reserve_impact_on_dispatchable():
-    # impact of reserve activation cost on dispatchable power
-    dispatchable = []
-    market = StochasticMarket()
-    alpha_3_values = [5, 7, 8, 10, 12, 16]
-    for alpha_3 in tqdm(alpha_3_values):
-        market.update_params({'alpha_3': alpha_3})
-        x1 = market.first_stage_outcome()
-        dispatchable.append(x1[-1])
-    
-    fig = plt.figure()
-    plt.rcParams.update({'font.size': 14})
-    ax = fig.add_subplot(1,1,1)
-    ax.plot(alpha_3_values, dispatchable, marker='o')
-    ax.set_xlabel('Reserve Activation Cost Parameter alpha_3')
-    ax.set_ylabel('Dispatchable power procured')
-    ax.set_title('Impact of Reserve Cost on Dispatchable Power Procurement')
-    plt.show()
-
-    return None
     
 def utility_on_lying():
-    # i = int(input("Enter participant index to test lying on (0-indexed): "))
     market = StochasticMarket()
     utility = []
     delta = copy.deepcopy(market.real_delta)
-    sigma_values = [0, 2, 4, 6, 8, 12, 16, 20, 24, 28, 32]
+    sigma_values = [0, 2, 4, 6, 8, 12, 20, 32] # standard deviation
 
     fig = plt.figure()
     plt.rcParams.update({'font.size': 14})
@@ -381,65 +333,100 @@ def utility_on_lying():
             market.update_params({'delta': delta})
             metrics = market.average_outcomes()
             utility[i].append( metrics['average_utility'][i] )
-        ax.plot(sigma_values, utility[i], label=f'Participant {i+1}')
-        ax.plot(market.real_delta[i][1][1], utility[i][sigma_values.index(market.real_delta[i][1][1])], marker='o', color='r') # mark true value
+        ax.semilogx(np.power(sigma_values, 2), utility[i], label=f'Participant {i+1}')
+        ax.plot(market.real_delta[i][1][1]**2, utility[i][sigma_values.index(market.real_delta[i][1][1])], marker='o', color='r') # mark true value
         delta[i][1][1] = market.real_delta[i][1][1] # reset to true value for next participant
-
     # ax.vlines(market.real_delta[i][1][1], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], color='r', linestyle='--', label='True sigma')
     ax.set_xlabel(f'Reported sigma by participants')
     ax.set_ylabel('Average Utility Received')
     ax.set_title(f'Impact of Lying on Participants\' Utility')
+    ax.legend()
     fig.savefig(f'IC.pdf')
     return np.round(utility, 2)
 
-def dynamic_vs_static():
-    # so in static, participants will lie but their real sigma will remain the same
-    market_dynamic = StochasticMarket()
-    market_static = StochasticMarket()
-    delta = copy.deepcopy(market_static.real_delta)
+def stochastic_vs_deterministic():
+    # so in deterministic, participants will lie but their real sigma will remain the same
+    market_stochastic = StochasticMarket()
+    market_deterministic = StochasticMarket()
+    delta = copy.deepcopy(market_deterministic.real_delta)
     
-    dynamic_metrics = market_dynamic.average_outcomes()
-    static_metrics = {}
+    stochastic_metrics = market_stochastic.average_outcomes()
+    print("stochastic:")
+    print("Dispatchable: ", stochastic_metrics['dispatchable_power'])
+    print("Reserve: ", stochastic_metrics['reserve_capacity'])
+    print("Average system cost: ", stochastic_metrics['average_system_cost'])
 
+    deterministic_metrics = {}
     for d in [2, 10]:
-        for i in range(market_static.n):
+        for i in range(market_deterministic.n):
             delta[i][1][1] = d
-        market_static.update_params({'delta': delta}) # participants report zero uncertainty in static mechanism
-        static_metrics[d] = market_static.average_outcomes()
-    
-    json.dump({'dynamic': dynamic_metrics, 'static': static_metrics}, open('dynamic_vs_static.json', 'w'), indent=4)
+        market_deterministic.update_params({'delta': delta}) # participants report zero uncertainty in deterministic mechanism
+        deterministic_metrics[d] = market_deterministic.average_outcomes()
 
-    # print("Static:")
-    # print("First-stage decision: ", market_static.first_stage_outcome())
-    # print("First-stage payments: ", static_metrics['payment1'])
-    # print("Second-stage payments: ", static_metrics['payment2'])
-    # print("Utilities: ", static_metrics['average_utility'])
-    # print("Average system cost: ", static_metrics['average_system_cost'])
+        print(f"deterministic {d}:")
+        print("Dispatchable: ", deterministic_metrics[d]['dispatchable_power'])
+        print("Reserve: ", deterministic_metrics[d]['reserve_capacity'])
+        print("Average system cost: ", deterministic_metrics[d]['average_system_cost'])
     
-    # print("Dynamic:")
-    # print("First-stage decision: ", market_dynamic.first_stage_outcome())
-    # print("First-stage payments: ", dynamic_metrics['payment1'])
-    # print("Second-stage payments: ", dynamic_metrics['payment2'])
-    # print("Utilities: ", dynamic_metrics['average_utility'])
-    # print("Average system cost: ", dynamic_metrics['average_system_cost'])
-
-    
-
+    json.dump({'stochastic': stochastic_metrics, 'deterministic': deterministic_metrics}, open('stochastic_vs_deterministic.json', 'w'), indent=4)
 
     return None
+
+def payments_uncertainty():
+    market = StochasticMarket(delta = [[[-100, 20, 300], [0, 2, 0]],
+                                      [[-100, 20, 300], [0, 4, 0]],
+                                      [[-100, 20, 300], [0, 6, 0]],
+                                      [[-100, 20, 300], [0, 8, 0]],
+                                      [[-100, 20, 300], [0, 32, 0]]])
+    
+    metrics = market.average_outcomes()
+    sigma_values = [2, 4, 6, 8, 32]
+    x = np.arange(len(sigma_values))
+    payment1_all = [metrics['payment1']]
+    payment2_all = [metrics['payment2']]
+    payment2std_all = [metrics['payment2std']]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    width = 0.6
+    ax.bar(x, metrics['payment1'], width, label='Payment 1', color='green', alpha=0.7)
+    ax.bar(x, metrics['payment2'], width, bottom=metrics['payment1'], label='Payment 2', color='red', alpha=0.7)
+    ax.errorbar(x, np.array(metrics['payment1']) + np.array(metrics['payment2']), yerr=metrics['payment2std'], fmt='o', color='black', capsize=5, label='Total')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'P{i+1}' for i in range(market.n)])
+    ax.set_ylabel('Payment')
+    ax.legend()
+    fig.savefig('payments_unc.pdf')
+
+def payments_flex():
+    market = StochasticMarket(delta = [[[-10, 20, 100], [0, 10, 0]],
+                                      [[-15, 20, 100], [0, 10, 0]],
+                                      [[-20, 20, 100], [0, 10, 0]],
+                                      [[-5, 20, 100], [0, 10, 0]],
+                                      [[-2, 20, 100], [0, 10, 0]]])
+    
+    metrics = market.average_outcomes()
+    flex_costs = [-10, -15, -20, -5, -2]
+    x = np.argsort(flex_costs)
+    payment1_all = [metrics['payment1']]
+    payment2_all = [metrics['payment2']]
+    payment2std_all = [metrics['payment2std']]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    width = 0.6
+    ax.bar(x, metrics['payment1'], width, label='Payment 1', color='green', alpha=0.7)
+    ax.bar(x, metrics['payment2'], width, bottom=metrics['payment1'], label='Payment 2', color='red', alpha=0.7)
+    ax.errorbar(x, np.array(metrics['payment1']) + np.array(metrics['payment2']), yerr=metrics['payment2std'], fmt='o', color='black', capsize=5, label='Total')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'P{i+1}' for i in range(market.n)])
+    ax.set_ylabel('Payment')
+    ax.legend()
+    fig.savefig('payments_flex.pdf')
 
 
 if __name__ == "__main__":
     np.random.seed(0)
     
-    # reserve_impact_on_dispatchable()
-    # dispatchable_impact()
-    # dynamic_vs_static()
-    print(utility_on_lying())
-
-    # start = time.time()
-    # market = StochasticMarket()
-    # print(market.average_outcomes(True))
-    # x1 = market.x1star()
-    # print(x1)
-    # print(time.time() - start)
+    print(utility_on_lying()) # Fig. 2 saves as IC.pdf
+    payments_uncertainty() # Fig. 3 (top) saves as payments_unc.pdf
+    payments_flex() # Fig. 3 (bottom) saves as payments_flex.pdf
+    stochastic_vs_deterministic() # Table 1 results saved in stochastic_vs_deterministic.json

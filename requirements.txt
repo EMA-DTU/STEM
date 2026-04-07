@@ -1,0 +1,8 @@
+torch==2.10.0
+gurobipy==13.0.1
+numpy==2.4.1
+matplotlib==3.10.8
+tqdm==4.67.2
+line_profiler==5.0.0
+scipy==1.17.0
+cvxpy==1.8.0
