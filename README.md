@@ -1,4 +1,4 @@
-# Stochastic Mechanism Design Experiments
+# Stochastic Electricity Markets (STEM)
 
 This repository contains code for reproducing the numerical experiments from the paper "Truthful Production Uncertainty in Electricity Markets: A Two-Stage Mechanism" available on [arXiv](https://arxiv.org/abs/2604.02455).
 
@@ -29,3 +29,16 @@ Run `payments_flex()` to analyze impact of production uncertainty on flexibility
 
 ### 3. Stochastic vs Deterministic Mechanisms (Table 1)
 Run `stochastic_vs_deterministic()` to compare stochastic vs. deterministic mechanisms. Saves results to `stochastic_vs_deterministic.json`.
+
+## Citing
+You can cite this paper as follows:
+```
+@misc{singhal2026truthful,
+      title={Truthful Production Uncertainty in Electricity Markets: A Two-Stage Mechanism}, 
+      author={Shobhit Singhal and Lesia Mitridati and Licio Romao},
+      year={2026},
+      eprint={2604.02455},
+      archivePrefix={arXiv},
+      url={https://arxiv.org/abs/2604.02455}, 
+}
+```
