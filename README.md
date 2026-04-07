@@ -23,9 +23,9 @@ This will run the experiments and generate the figures and data files.
 ### 1. Incentive compatibility (Fig. 2)
 Run `utility_on_lying()` to analyze utility changes with misreported production variance. Saves plot as `IC.pdf`.
 
-### 3. Impact of uncertainty and flexibility on payments (Fig. 3)
+### 2. Impact of uncertainty and flexibility on payments (Fig. 3)
 Run `payments_uncertainty()` to analyze impact of production uncertainty on payments. Saves plot as `payments_unc.pdf`.
 Run `payments_flex()` to analyze impact of production uncertainty on flexibility. Saves plot as `payments_flex.pdf`.
 
-### 2. Stochastic vs Deterministic Mechanisms (Table 1)
+### 3. Stochastic vs Deterministic Mechanisms (Table 1)
 Run `stochastic_vs_deterministic()` to compare stochastic vs. deterministic mechanisms. Saves results to `stochastic_vs_deterministic.json`.
