@@ -1,6 +1,6 @@
 # Stochastic Mechanism Design Experiments
 
-This repository contains code for reproducing the numerical experiments from the paper on stochastic mechanism design for electricity markets.
+This repository contains code for reproducing the numerical experiments from the paper "Truthful Production Uncertainty in Electricity Markets: A Two-Stage Mechanism" available on [arXiv](https://arxiv.org/abs/2604.02455).
 
 ## Prerequisites
 
